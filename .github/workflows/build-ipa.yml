@@ -1,0 +1,167 @@
+name: Build nxnative IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_name:
+        description: "Output IPA name (e.g. MarioWonder)"
+        required: true
+        default: "Game"
+      title_id:
+        description: "Title ID (optional, e.g. 010015100B514000)"
+        required: false
+        default: ""
+      package_version:
+        description: "Package version (optional, e.g. v327680 or leave empty for newest)"
+        required: false
+        default: ""
+      romfs_mode:
+        description: "RomFS mode"
+        required: true
+        default: "bundle"
+        type: choice
+        options:
+          - bundle
+          - separate
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-ipa:
+    name: Build unsigned IPA
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "$HOME/Library/Caches/org.swift.swiftpm" || true
+          rm -rf "$HOME/Library/Caches/Homebrew" || true
+          rm -rf "$HOME/.cache/pip" || true
+          brew cleanup -s || true
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      - name: Verify Xcode + Metal toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || true
+          xcodebuild -downloadComponent MetalToolchain
+          df -h
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang python@3.13
+          brew install --cask dotnet-sdk || true
+
+          PY_BASE="$(brew --prefix python@3.13)/bin/python3.13"
+          VENV="$RUNNER_TEMP/nxnative-venv"
+          "$PY_BASE" -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install \
+            lz4 "capstone>=5,<6" fonttools nsz zbic gdown \
+            "backports.zstd; python_version < '3.14'"
+          echo "PYTHON=$VENV/bin/python" >> "$GITHUB_ENV"
+
+      - name: Download game files + prod.keys from Secrets
+        env:
+          GAME_BASE_URL: ${{ secrets.GAME_BASE_URL }}
+          GAME_UPDATE_URL: ${{ secrets.GAME_UPDATE_URL }}
+          GAME_DLC_URL: ${{ secrets.GAME_DLC_URL }}
+          PROD_KEYS_URL: ${{ secrets.PROD_KEYS_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/game-input" "$RUNNER_TEMP/ipa-output"
+
+          if [[ -z "${GAME_BASE_URL:-}" || -z "${PROD_KEYS_URL:-}" ]]; then
+            echo "::error::GAME_BASE_URL and PROD_KEYS_URL secrets are required"
+            exit 1
+          fi
+
+          download() {
+            local url="$1"
+            local out="$2"
+            case "$url" in
+              *drive.google.com*|*docs.google.com*)
+                "$PYTHON" -m gdown --fuzzy "$url" -O "$out"
+                ;;
+              https://*|http://*)
+                curl --fail --location --retry 5 --retry-delay 3 -o "$out" "$url"
+                ;;
+              *)
+                echo "::error::Only HTTPS or Google Drive links supported"
+                exit 1
+                ;;
+            esac
+            test -s "$out"
+            echo "Downloaded: $out ($(du -h "$out" | cut -f1))"
+          }
+
+          download "$GAME_BASE_URL" "$RUNNER_TEMP/game-input/base.nsp"
+          [[ -n "${GAME_UPDATE_URL:-}" ]] && download "$GAME_UPDATE_URL" "$RUNNER_TEMP/game-input/update.nsp" || true
+          [[ -n "${GAME_DLC_URL:-}" ]]    && download "$GAME_DLC_URL"    "$RUNNER_TEMP/game-input/dlc.nsp"    || true
+          download "$PROD_KEYS_URL" "$RUNNER_TEMP/prod.keys"
+
+          echo "INPUT_DIR=$RUNNER_TEMP/game-input" >> "$GITHUB_ENV"
+          echo "KEYS_FILE=$RUNNER_TEMP/prod.keys"  >> "$GITHUB_ENV"
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          OUT_IPA="$RUNNER_TEMP/ipa-output/${{ inputs.game_name }}.ipa"
+
+          ARGS=(
+            "$INPUT_DIR"
+            --keys "$KEYS_FILE"
+            --romfs "${{ inputs.romfs_mode }}"
+            --out "$OUT_IPA"
+            --progress lines
+            --keep-extracted
+          )
+
+          [[ -n "${{ inputs.title_id }}" ]] && ARGS+=(--title-id "${{ inputs.title_id }}")
+          [[ -n "${{ inputs.package_version }}" ]] && ARGS+=(--package "${{ inputs.package_version }}")
+
+          echo "Running: $PYTHON scripts/build_ipa_from_nsp.py ${ARGS[*]}"
+          "$PYTHON" scripts/build_ipa_from_nsp.py "${ARGS[@]}"
+
+          test -s "$OUT_IPA"
+          ls -lh "$OUT_IPA"
+          echo "OUT_IPA=$OUT_IPA" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.game_name }}-unsigned-ipa
+          path: ${{ env.OUT_IPA }}
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 0
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/game-input/*_build/logs
+          if-no-files-found: ignore
+          retention-days: 3
