@@ -34,7 +34,7 @@ concurrency:
 jobs:
   build-ipa:
     name: Build unsigned IPA
-    runs-on: xcode-27-xlarge
+    runs-on: xcode-27
     timeout-minutes: 360
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
