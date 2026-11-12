@@ -13,7 +13,7 @@ concurrency:
 jobs:
   build-botw:
     name: Build BOTW 1.9.0 unsigned IPA
-    runs-on: xcode-27-xlarge
+    runs-on: xcode-27
     timeout-minutes: 360
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
