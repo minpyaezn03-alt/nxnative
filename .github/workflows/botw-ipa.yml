@@ -1,0 +1,140 @@
+name: BOTW IPA Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: botw-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-botw:
+    name: Build BOTW 1.9.0 unsigned IPA
+    runs-on: xcode-27-xlarge
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      TITLE_ID: "01007EF00011E000"
+      PACKAGE_VERSION: "v1114112"   # 1.9.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "$HOME/Library/Caches/org.swift.swiftpm" || true
+          rm -rf "$HOME/Library/Caches/Homebrew" || true
+          rm -rf "$HOME/.cache/pip" || true
+          brew cleanup -s || true
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      - name: Verify Xcode + Metal toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || true
+          xcodebuild -downloadComponent MetalToolchain
+          df -h
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang python@3.13
+          brew install --cask dotnet-sdk || true
+
+          PY_BASE="$(brew --prefix python@3.13)/bin/python3.13"
+          VENV="$RUNNER_TEMP/botw-venv"
+          "$PY_BASE" -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install \
+            lz4 "capstone>=5,<6" fonttools nsz zbic gdown \
+            "backports.zstd; python_version < '3.14'"
+          echo "PYTHON=$VENV/bin/python" >> "$GITHUB_ENV"
+
+      - name: Download BOTW base + update + prod.keys
+        env:
+          GAME_BASE_URL: ${{ secrets.BOTW_BASE_URL }}
+          GAME_UPDATE_URL: ${{ secrets.BOTW_UPDATE_URL }}
+          PROD_KEYS_URL: ${{ secrets.BOTW_PROD_KEYS_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/botw-input" "$RUNNER_TEMP/botw-output"
+
+          if [[ -z "${GAME_BASE_URL:-}" || -z "${GAME_UPDATE_URL:-}" || -z "${PROD_KEYS_URL:-}" ]]; then
+            echo "::error::Required secrets missing: BOTW_BASE_URL, BOTW_UPDATE_URL, BOTW_PROD_KEYS_URL"
+            exit 1
+          fi
+
+          download() {
+            local url="$1"
+            local out="$2"
+            case "$url" in
+              *drive.google.com*|*docs.google.com*)
+                "$PYTHON" -m gdown --fuzzy "$url" -O "$out"
+                ;;
+              https://*|http://*)
+                curl --fail --location --retry 5 --retry-delay 3 -o "$out" "$url"
+                ;;
+              *)
+                echo "::error::Only HTTPS or Google Drive links supported"
+                exit 1
+                ;;
+            esac
+            test -s "$out"
+            echo "Downloaded: $out ($(du -h "$out" | cut -f1))"
+          }
+
+          download "$GAME_BASE_URL"   "$RUNNER_TEMP/botw-input/BOTW-base.nsp"
+          download "$GAME_UPDATE_URL" "$RUNNER_TEMP/botw-input/BOTW-update-1.9.0.nsp"
+          download "$PROD_KEYS_URL"   "$RUNNER_TEMP/prod.keys"
+
+          echo "INPUT_DIR=$RUNNER_TEMP/botw-input" >> "$GITHUB_ENV"
+          echo "KEYS_FILE=$RUNNER_TEMP/prod.keys"  >> "$GITHUB_ENV"
+
+      - name: Build BOTW 1.9.0 unsigned IPA
+        run: |
+          set -euo pipefail
+          OUT_IPA="$RUNNER_TEMP/botw-output/BOTW-1.9.0.ipa"
+
+          "$PYTHON" scripts/build_ipa_from_nsp.py "$INPUT_DIR" \
+            --keys "$KEYS_FILE" \
+            --title-id "$TITLE_ID" \
+            --package "$PACKAGE_VERSION" \
+            --romfs bundle \
+            --keep-extracted \
+            --out "$OUT_IPA" \
+            --progress lines
+
+          test -s "$OUT_IPA"
+          ls -lh "$OUT_IPA"
+          echo "OUT_IPA=$OUT_IPA" >> "$GITHUB_ENV"
+
+      - name: Upload BOTW IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOTW-1.9.0-unsigned-ipa
+          path: ${{ env.OUT_IPA }}
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 0
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: botw-build-logs
+          path: |
+            ${{ runner.temp }}/botw-input/01007EF00011E000_build/logs
+          if-no-files-found: ignore
+          retention-days: 3
