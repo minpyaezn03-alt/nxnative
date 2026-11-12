@@ -35,7 +35,6 @@ jobs:
           df -h
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
           rm -rf "$HOME/Library/Caches/org.swift.swiftpm" || true
-          # Keep runner.temp caches we restore below; only clear default paths
           rm -rf "$HOME/Library/Caches/Homebrew" || true
           rm -rf "$HOME/.cache/pip" || true
           brew cleanup -s || true
@@ -101,15 +100,12 @@ jobs:
 
           extract_gdrive_id() {
             local url="$1"
-            if [[ "$url" =~ /file/d/([a-zA-Z0-9_-]+) ]]; then
-              echo "${BASH_REMATCH[1]}"
-            elif [[ "$url" =~ [?&]id=([a-zA-Z0-9_-]+) ]]; then
-              echo "${BASH_REMATCH[1]}"
-            elif [[ "$url" =~ /open\?id=([a-zA-Z0-9_-]+) ]]; then
-              echo "${BASH_REMATCH[1]}"
-            else
-              echo ""
-            fi
+            # Prefer sed over bash [[ =~ ]] (ampersand in character class breaks bash)
+            echo "$url" | sed -nE \
+              -e 's#.*/file/d/([A-Za-z0-9_-]+).*#\1#p' \
+              -e 's#.*[?&]id=([A-Za-z0-9_-]+).*#\1#p' \
+              -e 's#.*/open\?id=([A-Za-z0-9_-]+).*#\1#p' \
+              | head -1
           }
 
           download_gdrive() {
