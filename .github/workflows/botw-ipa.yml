@@ -76,13 +76,104 @@ jobs:
             exit 1
           fi
 
+          extract_gdrive_id() {
+            local url="$1"
+            if [[ "$url" =~ /file/d/([a-zA-Z0-9_-]+) ]]; then
+              echo "${BASH_REMATCH[1]}"
+            elif [[ "$url" =~ [?&]id=([a-zA-Z0-9_-]+) ]]; then
+              echo "${BASH_REMATCH[1]}"
+            elif [[ "$url" =~ /open\?id=([a-zA-Z0-9_-]+) ]]; then
+              echo "${BASH_REMATCH[1]}"
+            else
+              echo ""
+            fi
+          }
+
+          download_gdrive() {
+            local url="$1"
+            local out="$2"
+            local fid
+            fid="$(extract_gdrive_id "$url")"
+
+            echo "Google Drive download → $out"
+            if [[ -n "$fid" ]]; then
+              echo "File ID: $fid"
+            fi
+
+            # 1) Try gdown by file id (most reliable when public)
+            if [[ -n "$fid" ]]; then
+              if "$PYTHON" -m gdown --id "$fid" -O "$out" --continue 2>/tmp/gdown.err; then
+                if [[ -s "$out" ]]; then
+                  echo "gdown (id) OK"
+                  return 0
+                fi
+              fi
+              echo "gdown (id) failed:"
+              cat /tmp/gdown.err || true
+            fi
+
+            # 2) Try gdown with original URL
+            if "$PYTHON" -m gdown "$url" -O "$out" --continue 2>/tmp/gdown.err; then
+              if [[ -s "$out" ]]; then
+                echo "gdown (url) OK"
+                return 0
+              fi
+            fi
+            echo "gdown (url) failed:"
+            cat /tmp/gdown.err || true
+
+            # 3) Fallback: curl + virus-scan confirm token (large files)
+            if [[ -n "$fid" ]]; then
+              echo "Trying curl + confirm token..."
+              local tmphtml conf
+              tmphtml="$(mktemp)"
+              curl -sL -c /tmp/gdrive.cookies -b /tmp/gdrive.cookies \
+                "https://drive.google.com/uc?export=download&id=${fid}" -o "$tmphtml" || true
+
+              conf="$(grep -oE 'confirm=[-0-9A-Za-z_]+' "$tmphtml" | head -1 | cut -d= -f2 || true)"
+              if [[ -z "$conf" ]]; then
+                conf="$(grep -oE 'name="confirm" value="[^"]+"' "$tmphtml" | head -1 | sed -E 's/.*value="([^"]+)".*/\1/' || true)"
+              fi
+              rm -f "$tmphtml"
+
+              if [[ -n "$conf" ]]; then
+                echo "Confirm token: $conf"
+                curl --fail --location --retry 3 --retry-delay 2 \
+                  -c /tmp/gdrive.cookies -b /tmp/gdrive.cookies \
+                  -o "$out" \
+                  "https://drive.google.com/uc?export=download&confirm=${conf}&id=${fid}"
+              else
+                curl --fail --location --retry 3 --retry-delay 2 \
+                  -c /tmp/gdrive.cookies -b /tmp/gdrive.cookies \
+                  -o "$out" \
+                  "https://drive.google.com/uc?export=download&id=${fid}&confirm=t"
+              fi
+
+              if [[ -s "$out" ]]; then
+                # Reject HTML error pages masquerading as downloads
+                if file "$out" | grep -qi 'HTML\|ASCII text'; then
+                  echo "::error::Download looks like an HTML page, not the file. Drive still blocked."
+                  head -c 400 "$out" || true
+                  rm -f "$out"
+                  return 1
+                fi
+                echo "curl fallback OK"
+                return 0
+              fi
+            fi
+
+            echo "::error::All Google Drive download methods failed for: $url"
+            echo "Make sure Share = Anyone with the link (Viewer)."
+            echo "Large files often need a non-Drive host (Mega, catbox, direct HTTPS)."
+            return 1
+          }
+
           download() {
             local url="$1"
             local out="$2"
             case "$url" in
               *drive.google.com*|*docs.google.com*)
-                # gdown 5.x: pass the share URL directly (no --fuzzy)
-                "$PYTHON" -m gdown "$url" -O "$out" --continue
+                download_gdrive "$url" "$out"
                 ;;
               https://*|http://*)
                 curl --fail --location --retry 5 --retry-delay 3 -o "$out" "$url"
