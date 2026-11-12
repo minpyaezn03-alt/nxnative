@@ -19,6 +19,8 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       TITLE_ID: "01007EF00011E000"
       PACKAGE_VERSION: "v1114112"   # 1.9.0
+      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
+      HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
 
     steps:
       - name: Checkout repository
@@ -33,11 +35,28 @@ jobs:
           df -h
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
           rm -rf "$HOME/Library/Caches/org.swift.swiftpm" || true
+          # Keep runner.temp caches we restore below; only clear default paths
           rm -rf "$HOME/Library/Caches/Homebrew" || true
           rm -rf "$HOME/.cache/pip" || true
           brew cleanup -s || true
           echo "=== Disk after cleanup ==="
           df -h
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HOMEBREW_CACHE }}
+          key: brew-xcode27-${{ runner.os }}-${{ hashFiles('.github/workflows/botw-ipa.yml') }}
+          restore-keys: |
+            brew-xcode27-${{ runner.os }}-
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: pip-botw-${{ runner.os }}-py313-${{ hashFiles('.github/workflows/botw-ipa.yml') }}
+          restore-keys: |
+            pip-botw-${{ runner.os }}-py313-
 
       - name: Verify Xcode + Metal toolchain
         run: |
@@ -50,6 +69,9 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
+          mkdir -p "$HOMEBREW_CACHE" "$PIP_CACHE_DIR"
+          export HOMEBREW_CACHE
+
           brew install xcodegen zstd glslang python@3.13
           brew install --cask dotnet-sdk || true
 
@@ -58,6 +80,7 @@ jobs:
           "$PY_BASE" -m venv "$VENV"
           "$VENV/bin/python" -m pip install --upgrade pip
           "$VENV/bin/python" -m pip install \
+            --cache-dir "$PIP_CACHE_DIR" \
             lz4 "capstone>=5,<6" fonttools nsz zbic "gdown>=5.0" \
             "backports.zstd; python_version < '3.14'"
           echo "PYTHON=$VENV/bin/python" >> "$GITHUB_ENV"
@@ -100,7 +123,6 @@ jobs:
               echo "File ID: $fid"
             fi
 
-            # 1) Try gdown by file id (most reliable when public)
             if [[ -n "$fid" ]]; then
               if "$PYTHON" -m gdown --id "$fid" -O "$out" --continue 2>/tmp/gdown.err; then
                 if [[ -s "$out" ]]; then
@@ -112,7 +134,6 @@ jobs:
               cat /tmp/gdown.err || true
             fi
 
-            # 2) Try gdown with original URL
             if "$PYTHON" -m gdown "$url" -O "$out" --continue 2>/tmp/gdown.err; then
               if [[ -s "$out" ]]; then
                 echo "gdown (url) OK"
@@ -122,7 +143,6 @@ jobs:
             echo "gdown (url) failed:"
             cat /tmp/gdown.err || true
 
-            # 3) Fallback: curl + virus-scan confirm token (large files)
             if [[ -n "$fid" ]]; then
               echo "Trying curl + confirm token..."
               local tmphtml conf
@@ -150,7 +170,6 @@ jobs:
               fi
 
               if [[ -s "$out" ]]; then
-                # Reject HTML error pages masquerading as downloads
                 if file "$out" | grep -qi 'HTML\|ASCII text'; then
                   echo "::error::Download looks like an HTML page, not the file. Drive still blocked."
                   head -c 400 "$out" || true
